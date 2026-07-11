@@ -1,0 +1,50 @@
+name: Temporary RSA multi-attack check
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  attack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install and run RsaCtfTool
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y git python3-venv python3-dev build-essential libgmp-dev gmp-ecm pari-gp
+          git clone --depth 1 https://github.com/RsaCtfTool/RsaCtfTool.git
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install --upgrade pip wheel
+          pip install -e ./RsaCtfTool
+
+          cat > public.pem <<'EOF'
+          -----BEGIN PUBLIC KEY-----
+          MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBAMEqBH+YAFXSYlFpB9c4D5D0dTSCgCY3
+          5GERNVpIwffOBZsYpV3X8iKZbOHxr1LSe3QmIrZXGZdRZzPtbPega9UCAwEAAQ==
+          -----END PUBLIC KEY-----
+          EOF
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('message.txt.enc').write_bytes(bytes.fromhex('42143df2f5213a1db4a1f1c3a9ed70b86f0e8735ed18791e554559e82d4e78dfd1cca6c6efef480ac9fa30287f922a912ce16ceab1e09dfe9417e821d74cd401'))
+          PY
+
+          timeout 1200s RsaCtfTool \
+            --publickey public.pem \
+            --decryptfile message.txt.enc \
+            --ecmdigits 45 \
+            --attack all 2>&1 | tee rsactftool.log || true
+
+          echo '===== FLAG CANDIDATES ====='
+          grep -Eao '[A-Za-z0-9_!-]+\{[^}\r\n]+\}' rsactftool.log message.txt.enc 2>/dev/null || true
+
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsactftool-output
+          path: rsactftool.log
+          retention-days: 1
