@@ -1,0 +1,270 @@
+name: Temporary CADO known-polynomial factorization
+
+on:
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      GH_TOKEN: ${{ github.token }}
+      N: "10116826442515149051392611733205827011722944451362642771770045505667725998729915183231335575925571009069841003168435739560778665229411847850106225023806421"
+    steps:
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3 python3-flask python3-requests libgmp10 libhwloc15 libsqlite3-0 curl
+
+      - name: Restore compiled CADO tree
+        uses: actions/cache/restore@v4
+        with:
+          path: cado-nfs
+          key: temporary-cado-29153764667
+          fail-on-cache-miss: true
+
+      - name: Start known-polynomial factor server
+        shell: bash
+        run: |
+          set -u
+          export HOSTNAME=cado-runner
+          chmod -R u+rwX cado-nfs
+          mkdir -p work-known
+
+          cat > known.poly <<EOF
+          n: $N
+          skew: 876906.393
+          c0: -16470622321156381973548533680349138240
+          c1: -16302008677888234990047503203209
+          c2: 134454953686800627302444844
+          c3: 493352545891106071
+          c4: -137952806322706
+          c5: 892440
+          Y0: -965478882869038293747166431446
+          Y1: 243108384437732509
+          # MurphyE 2.088e-08
+          EOF
+
+          cp cado-nfs/parameters/factor/params.c155 known.params
+          cat >> known.params <<EOF
+          N = $N
+          tasks.workdir = $GITHUB_WORKSPACE/work-known
+          tasks.polyselect.import = $GITHUB_WORKSPACE/known.poly
+          tasks.threads = 2
+          tasks.linalg.threads = 4
+          tasks.wutimeout = 1800
+          tasks.maxtimedout = 10000
+          server.address = 0.0.0.0
+          server.port = 8001
+          server.ssl = no
+          server.whitelist = 0.0.0.0/0
+          EOF
+
+          timeout --signal=TERM 19800s ./cado-nfs/cado-nfs.py known.params --server > server-known.log 2>&1 &
+          CADO_PID=$!
+
+          SERVER_READY=0
+          for i in $(seq 1 240); do
+            if curl -sS --max-time 2 http://127.0.0.1:8001/ >/dev/null 2>&1; then
+              SERVER_READY=1
+              break
+            fi
+            if ! kill -0 "$CADO_PID" 2>/dev/null; then
+              echo "CADO exited before startup"
+              tail -300 server-known.log
+              exit 1
+            fi
+            sleep 2
+          done
+          if [ "$SERVER_READY" -ne 1 ]; then
+            echo "CADO server did not become ready"
+            tail -300 server-known.log
+            kill "$CADO_PID" 2>/dev/null || true
+            exit 1
+          fi
+
+          curl -L --retry 5 --fail -o cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          ./cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8001 > tunnel-known.log 2>&1 &
+          TUNNEL_PID=$!
+
+          ENDPOINT=""
+          for i in $(seq 1 120); do
+            ENDPOINT=$(grep -Eo 'https://[-a-z0-9]+\.trycloudflare\.com' tunnel-known.log | tail -1 || true)
+            [ -n "$ENDPOINT" ] && break
+            sleep 2
+          done
+          if [ -z "$ENDPOINT" ]; then
+            echo "Cloudflare endpoint was not created"
+            cat tunnel-known.log
+            kill "$CADO_PID" 2>/dev/null || true
+            exit 1
+          fi
+
+          ENDPOINT_PORT="${ENDPOINT}:443"
+          echo "Known-poly CADO endpoint: $ENDPOINT_PORT"
+          gh api "repos/$GITHUB_REPOSITORY/issues/${{ github.event.pull_request.number }}/comments" \
+            -f body="CADO_KNOWN_ENDPOINT_${GITHUB_RUN_ID}=${ENDPOINT_PORT}"
+
+          cd cado-nfs
+          eval "$(make show)"
+          python3 ./cado-nfs-client.py \
+            --server=http://127.0.0.1:8001 \
+            --bindir="$build_tree" \
+            --basepath=/tmp/cado-known-local \
+            --clientid="gha-known-${GITHUB_RUN_ID}-local" \
+            --downloadretry=5 \
+            --max_connection_failures=30 \
+            --exit-on-server-gone > ../local-known-client.log 2>&1 &
+          LOCAL_PID=$!
+          cd ..
+
+          wait "$CADO_PID" || true
+          kill "$LOCAL_PID" 2>/dev/null || true
+          kill "$TUNNEL_PID" 2>/dev/null || true
+
+          tail -500 server-known.log
+
+          python3 - <<'PY' | tee decrypt-known.txt
+          import re
+          from pathlib import Path
+
+          N = 10116826442515149051392611733205827011722944451362642771770045505667725998729915183231335575925571009069841003168435739560778665229411847850106225023806421
+          e = 65537
+          c = int('42143df2f5213a1db4a1f1c3a9ed70b86f0e8735ed18791e554559e82d4e78dfd1cca6c6efef480ac9fa30287f922a912ce16ceab1e09dfe9417e821d74cd401', 16)
+          text = Path('server-known.log').read_text(errors='ignore')
+          for path in Path('work-known').rglob('*'):
+              if path.is_file() and path.stat().st_size < 100_000_000:
+                  try:
+                      text += '\n' + path.read_text(errors='ignore')
+                  except Exception:
+                      pass
+          nums = {int(x) for x in re.findall(r'(?<![0-9])[0-9]{20,}(?![0-9])', text)}
+          factors = sorted(x for x in nums if 1 < x < N and N % x == 0)
+          if not factors:
+              print('FACTOR_NOT_FINISHED')
+              raise SystemExit(0)
+          p = factors[0]
+          q = N // p
+          print(f'P={p}')
+          print(f'Q={q}')
+          d = pow(e, -1, (p - 1) * (q - 1))
+          em = pow(c, d, N).to_bytes((N.bit_length() + 7) // 8, 'big')
+          msg = em.split(b'\x00', 2)[2] if em.startswith(b'\x00\x02') and b'\x00' in em[2:] else em.lstrip(b'\x00')
+          print('EM_HEX=' + em.hex())
+          print('PLAINTEXT_REPR=' + repr(msg))
+          try:
+              decoded = msg.decode()
+              print('PLAINTEXT=' + decoded)
+              m = re.search(r'[A-Za-z0-9_!-]+\{[^}\r\n]+\}', decoded)
+              if m:
+                  print('FLAG=' + m.group(0))
+          except UnicodeDecodeError:
+              pass
+          PY
+
+          if grep -q '^FLAG=' decrypt-known.txt; then
+            RESULT=$(grep '^FLAG=' decrypt-known.txt | tail -1)
+            gh api "repos/$GITHUB_REPOSITORY/issues/${{ github.event.pull_request.number }}/comments" \
+              -f body="CADO_RESULT_${GITHUB_RUN_ID}=${RESULT}"
+          fi
+
+      - name: Upload known-poly server state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cado-known-server-${{ github.run_id }}
+          path: |
+            server-known.log
+            local-known-client.log
+            tunnel-known.log
+            decrypt-known.txt
+            known.poly
+            known.params
+            work-known
+          retention-days: 1
+          compression-level: 1
+
+  client:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        id: [1, 2, 3, 4, 5, 6, 7, 8]
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3 python3-requests libgmp10 libhwloc15 libsqlite3-0
+
+      - name: Restore compiled CADO tree
+        uses: actions/cache/restore@v4
+        with:
+          path: cado-nfs
+          key: temporary-cado-29153764667
+          fail-on-cache-miss: true
+
+      - name: Wait for endpoint and run patched client
+        shell: bash
+        run: |
+          set -o pipefail
+          ENDPOINT=""
+          for i in $(seq 1 300); do
+            ENDPOINT=$(gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/issues/${{ github.event.pull_request.number }}/comments" \
+              --jq ".[].body" 2>/dev/null | \
+              sed -n "s/^CADO_KNOWN_ENDPOINT_${GITHUB_RUN_ID}=//p" | tail -1 || true)
+            [ -n "$ENDPOINT" ] && break
+            sleep 5
+          done
+          if [ -z "$ENDPOINT" ]; then
+            echo "No known-poly endpoint found"
+            exit 1
+          fi
+
+          cd cado-nfs
+          export HOSTNAME=cado-runner
+          eval "$(make show)"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('cado-nfs-client.py')
+          s = p.read_text()
+          old = "        kwargs['verify'] = self.cafile if self.cafile else False\n        logging.debug(f\"arguments to {req} {ep}: %s\", kwargs)"
+          new = "        kwargs['verify'] = self.cafile if self.cafile else False\n        kwargs.setdefault('headers', {})['Accept-Encoding'] = 'identity'\n        logging.debug(f\"arguments to {req} {ep}: %s\", kwargs)"
+          if old in s:
+              p.write_text(s.replace(old, new, 1))
+          PY
+
+          python3 ./cado-nfs-client.py \
+            --server="$ENDPOINT" \
+            --bindir="$build_tree" \
+            --basepath="/tmp/cado-known-${{ matrix.id }}" \
+            --clientid="gha-known-${GITHUB_RUN_ID}-${{ matrix.id }}" \
+            --downloadretry=5 \
+            --max_connection_failures=30 \
+            --nocncheck \
+            --nosha1check \
+            --loglevel=INFO \
+            --logfile="$GITHUB_WORKSPACE/known-client-${{ matrix.id }}.log" \
+            --exit-on-server-gone 2>&1 | tee "$GITHUB_WORKSPACE/known-client-${{ matrix.id }}-console.log"
+
+      - name: Upload client logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cado-known-client-${{ matrix.id }}-${{ github.run_id }}
+          path: |
+            known-client-${{ matrix.id }}.log
+            known-client-${{ matrix.id }}-console.log
+          retention-days: 1
