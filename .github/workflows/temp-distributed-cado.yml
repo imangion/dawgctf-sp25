@@ -10,33 +10,27 @@ permissions:
   pull-requests: write
 
 jobs:
-  build:
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 10
     steps:
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y build-essential cmake git python3 python3-flask python3-requests libgmp-dev libhwloc-dev libsqlite3-dev
+      - name: Restore compiled CADO tree
+        uses: actions/cache/restore@v4
+        with:
+          path: cado-nfs
+          key: temporary-cado-f3679dba1dc8f0fa579508f36ca5f82f7cbe2b7b
+          fail-on-cache-miss: true
 
-      - name: Build CADO-NFS once
+      - name: Verify compiled CADO tree
         run: |
-          git clone --depth 1 https://github.com/cado-nfs/cado-nfs.git
           cd cado-nfs
           export HOSTNAME=cado-runner
-          make -j2 > build.log 2>&1 || { tail -300 build.log; exit 1; }
           eval "$(make show)"
           test -x "$build_tree/sieve/las"
           echo "Build tree: $build_tree"
 
-      - name: Cache compiled CADO tree
-        uses: actions/cache/save@v4
-        with:
-          path: cado-nfs
-          key: temporary-cado-${{ github.sha }}
-
   server:
-    needs: build
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 355
     env:
@@ -52,7 +46,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: cado-nfs
-          key: temporary-cado-${{ github.sha }}
+          key: temporary-cado-f3679dba1dc8f0fa579508f36ca5f82f7cbe2b7b
           fail-on-cache-miss: true
 
       - name: Run factor server
@@ -64,21 +58,28 @@ jobs:
           chmod -R u+rwX cado-nfs
           mkdir -p work
 
-          timeout --signal=TERM 19800s ./cado-nfs/cado-nfs.py "$N" \
-            -t 2 \
-            tasks.linalg.threads=4 \
-            tasks.workdir="$GITHUB_WORKSPACE/work" \
-            tasks.wutimeout=1800 \
-            tasks.maxtimedout=10000 \
-            server.address=0.0.0.0 \
-            server.port=8001 \
-            server.ssl=no \
-            server.whitelist=0.0.0.0/0 \
+          cp cado-nfs/parameters/factor/params.c155 distributed.params
+          cat >> distributed.params <<EOF
+          N = $N
+          tasks.workdir = $GITHUB_WORKSPACE/work
+          tasks.threads = 2
+          tasks.linalg.threads = 4
+          tasks.wutimeout = 1800
+          tasks.maxtimedout = 10000
+          server.address = 0.0.0.0
+          server.port = 8001
+          server.ssl = no
+          server.whitelist = 0.0.0.0/0
+          EOF
+
+          timeout --signal=TERM 19800s ./cado-nfs/cado-nfs.py distributed.params \
             --server > server.log 2>&1 &
           CADO_PID=$!
 
+          SERVER_READY=0
           for i in $(seq 1 180); do
             if curl -fsS --max-time 2 http://127.0.0.1:8001/ >/dev/null 2>&1; then
+              SERVER_READY=1
               break
             fi
             if ! kill -0 "$CADO_PID" 2>/dev/null; then
@@ -88,6 +89,12 @@ jobs:
             fi
             sleep 2
           done
+          if [ "$SERVER_READY" -ne 1 ]; then
+            echo "CADO workunit server did not become ready"
+            tail -300 server.log
+            kill "$CADO_PID" 2>/dev/null || true
+            exit 1
+          fi
 
           curl -L --retry 5 --fail -o cloudflared \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -174,12 +181,13 @@ jobs:
             server.log
             tunnel.log
             decrypt_result.txt
+            distributed.params
             work
           retention-days: 1
           compression-level: 1
 
   client:
-    needs: build
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 350
     strategy:
@@ -198,7 +206,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: cado-nfs
-          key: temporary-cado-${{ github.sha }}
+          key: temporary-cado-f3679dba1dc8f0fa579508f36ca5f82f7cbe2b7b
           fail-on-cache-miss: true
 
       - name: Wait for endpoint and run client
