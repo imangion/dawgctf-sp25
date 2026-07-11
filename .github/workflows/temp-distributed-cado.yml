@@ -28,7 +28,7 @@ jobs:
           key: temporary-cado-29153764667
           fail-on-cache-miss: true
 
-      - name: Run distributed CADO client
+      - name: Patch client for Cloudflare and run
         shell: bash
         run: |
           set -o pipefail
@@ -36,6 +36,18 @@ jobs:
           cd cado-nfs
           export HOSTNAME=cado-runner
           eval "$(make show)"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('cado-nfs-client.py')
+          s = p.read_text()
+          old = "        kwargs['verify'] = self.cafile if self.cafile else False\n        logging.debug(f\"arguments to {req} {ep}: %s\", kwargs)"
+          new = "        kwargs['verify'] = self.cafile if self.cafile else False\n        kwargs.setdefault('headers', {})['Accept-Encoding'] = 'identity'\n        logging.debug(f\"arguments to {req} {ep}: %s\", kwargs)"
+          if old not in s:
+              raise SystemExit('Patch target not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
           python3 ./cado-nfs-client.py \
             --server="$ENDPOINT" \
             --bindir="$build_tree" \
