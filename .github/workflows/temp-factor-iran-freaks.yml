@@ -12,13 +12,14 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake git python3 python3-venv python3-pip libgmp-dev libhwloc-dev libsqlite3-dev
+          sudo apt-get install -y build-essential cmake git python3 python3-venv python3-pip libgmp-dev libhwloc-dev libsqlite3-dev libssl-dev libcurl4-openssl-dev python3-flask python3-requests
 
       - name: Build CADO-NFS
         run: |
           git clone --depth 1 https://gitlab.inria.fr/cado-nfs/cado-nfs.git
           cd cado-nfs
-          make -j2
+          make -j2 > build.log 2>&1 || { tail -250 build.log; exit 1; }
+          tail -50 build.log
 
       - name: Factor and decrypt
         shell: bash
@@ -27,7 +28,7 @@ jobs:
           N='10116826442515149051392611733205827011722944451362642771770045505667725998729915183231335575925571009069841003168435739560778665229411847850106225023806421'
           ./cado-nfs/cado-nfs.py "$N" tasks.threads=4 2>&1 | tee factor.log
           python3 - <<'PY'
-          import math, re
+          import re
           N = 10116826442515149051392611733205827011722944451362642771770045505667725998729915183231335575925571009069841003168435739560778665229411847850106225023806421
           e = 65537
           c = int('42143df2f5213a1db4a1f1c3a9ed70b86f0e8735ed18791e554559e82d4e78dfd1cca6c6efef480ac9fa30287f922a912ce16ceab1e09dfe9417e821d74cd401', 16)
@@ -40,14 +41,10 @@ jobs:
           q = N // p
           print(f'P={p}')
           print(f'Q={q}')
-          phi = (p - 1) * (q - 1)
-          d = pow(e, -1, phi)
+          d = pow(e, -1, (p - 1) * (q - 1))
           em = pow(c, d, N).to_bytes((N.bit_length() + 7) // 8, 'big')
           print('EM_HEX=' + em.hex())
-          if em.startswith(b'\x00\x02'):
-              msg = em.split(b'\x00', 2)[2]
-          else:
-              msg = em.lstrip(b'\x00')
+          msg = em.split(b'\x00', 2)[2] if em.startswith(b'\x00\x02') else em.lstrip(b'\x00')
           print('PLAINTEXT_REPR=' + repr(msg))
           try:
               print('PLAINTEXT=' + msg.decode())
