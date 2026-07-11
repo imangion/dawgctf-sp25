@@ -10,27 +10,35 @@ permissions:
   pull-requests: write
 
 jobs:
-  prepare:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 60
     steps:
-      - name: Restore compiled CADO tree
-        uses: actions/cache/restore@v4
-        with:
-          path: cado-nfs
-          key: temporary-cado-f3679dba1dc8f0fa579508f36ca5f82f7cbe2b7b
-          fail-on-cache-miss: true
-
-      - name: Verify compiled CADO tree
+      - name: Install build dependencies
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential cmake git python3 python3-flask python3-requests libgmp-dev libhwloc-dev libsqlite3-dev
+
+      - name: Build CADO-NFS once
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/cado-nfs/cado-nfs.git
           cd cado-nfs
           export HOSTNAME=cado-runner
+          make -j4 > build.log 2>&1 || { tail -300 build.log; exit 1; }
           eval "$(make show)"
           test -x "$build_tree/sieve/las"
           echo "Build tree: $build_tree"
 
+      - name: Cache compiled CADO tree
+        uses: actions/cache/save@v4
+        with:
+          path: cado-nfs
+          key: temporary-cado-${{ github.run_id }}
+
   server:
-    needs: prepare
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 355
     env:
@@ -46,7 +54,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: cado-nfs
-          key: temporary-cado-f3679dba1dc8f0fa579508f36ca5f82f7cbe2b7b
+          key: temporary-cado-${{ github.run_id }}
           fail-on-cache-miss: true
 
       - name: Run factor server
@@ -77,8 +85,8 @@ jobs:
           CADO_PID=$!
 
           SERVER_READY=0
-          for i in $(seq 1 180); do
-            if curl -fsS --max-time 2 http://127.0.0.1:8001/ >/dev/null 2>&1; then
+          for i in $(seq 1 240); do
+            if curl -sS --max-time 2 http://127.0.0.1:8001/ >/dev/null 2>&1; then
               SERVER_READY=1
               break
             fi
@@ -119,7 +127,21 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/issues/${{ github.event.pull_request.number }}/comments" \
             -f body="CADO_ENDPOINT_${GITHUB_RUN_ID}=${ENDPOINT}"
 
+          cd cado-nfs
+          eval "$(make show)"
+          python3 ./cado-nfs-client.py \
+            --server=http://127.0.0.1:8001 \
+            --bindir="$build_tree" \
+            --basepath=/tmp/cado-server-local \
+            --clientid="gha-${GITHUB_RUN_ID}-local" \
+            --downloadretry=5 \
+            --max_connection_failures=30 \
+            --exit-on-server-gone > ../local-client.log 2>&1 &
+          LOCAL_CLIENT_PID=$!
+          cd ..
+
           wait "$CADO_PID" || true
+          kill "$LOCAL_CLIENT_PID" 2>/dev/null || true
           kill "$TUNNEL_PID" 2>/dev/null || true
 
           echo "===== LAST SERVER LOG LINES ====="
@@ -179,6 +201,7 @@ jobs:
           name: temporary-cado-server-${{ github.run_id }}
           path: |
             server.log
+            local-client.log
             tunnel.log
             decrypt_result.txt
             distributed.params
@@ -187,11 +210,12 @@ jobs:
           compression-level: 1
 
   client:
-    needs: prepare
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 350
     strategy:
       fail-fast: false
+      max-parallel: 16
       matrix:
         id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     env:
@@ -206,7 +230,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: cado-nfs
-          key: temporary-cado-f3679dba1dc8f0fa579508f36ca5f82f7cbe2b7b
+          key: temporary-cado-${{ github.run_id }}
           fail-on-cache-miss: true
 
       - name: Wait for endpoint and run client
@@ -214,7 +238,7 @@ jobs:
         run: |
           set -u
           ENDPOINT=""
-          for i in $(seq 1 180); do
+          for i in $(seq 1 240); do
             ENDPOINT=$(gh api --paginate \
               "repos/$GITHUB_REPOSITORY/issues/${{ github.event.pull_request.number }}/comments" \
               --jq ".[].body" 2>/dev/null | \
