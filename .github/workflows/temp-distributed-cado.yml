@@ -1,13 +1,20 @@
-name: Temporary CADO client diagnostic
+name: Temporary distributed CADO rescue clients
 
 on:
   pull_request:
     branches: [ main ]
 
 jobs:
-  diagnose:
+  client:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      max-parallel: 16
+      matrix:
+        id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    env:
+      ENDPOINT: https://insider-grab-kills-locks.trycloudflare.com:443
     steps:
       - name: Install runtime dependencies
         run: |
@@ -21,41 +28,34 @@ jobs:
           key: temporary-cado-29153764667
           fail-on-cache-miss: true
 
-      - name: Test endpoint and CADO client
+      - name: Run distributed CADO client
         shell: bash
-        env:
-          ENDPOINT: https://insider-grab-kills-locks.trycloudflare.com
         run: |
-          set +e
-          echo '===== CURL ROOT =====' | tee diagnostic.log
-          curl -vk --max-time 20 "$ENDPOINT/" 2>&1 | tee -a diagnostic.log
-
+          set -o pipefail
+          curl -fsS --max-time 20 "$ENDPOINT/" | tee endpoint-check.txt
           cd cado-nfs
           export HOSTNAME=cado-runner
           eval "$(make show)"
-          echo "build_tree=$build_tree" | tee -a ../diagnostic.log
-
-          timeout 180s python3 ./cado-nfs-client.py \
+          python3 ./cado-nfs-client.py \
             --server="$ENDPOINT" \
             --bindir="$build_tree" \
-            --basepath=/tmp/cado-diagnostic \
-            --clientid="gha-diagnostic-${GITHUB_RUN_ID}" \
-            --downloadretry=2 \
-            --max_connection_failures=3 \
+            --basepath="/tmp/cado-rescue-${{ matrix.id }}" \
+            --clientid="gha-rescue-${GITHUB_RUN_ID}-${{ matrix.id }}" \
+            --downloadretry=5 \
+            --max_connection_failures=30 \
             --nocncheck \
             --nosha1check \
-            --loglevel=DEBUG \
-            --logfile="$GITHUB_WORKSPACE/client.log" 2>&1 | tee -a ../diagnostic.log
-          RC=${PIPESTATUS[0]}
-          echo "client_rc=$RC" | tee -a ../diagnostic.log
-          exit 0
+            --loglevel=INFO \
+            --logfile="$GITHUB_WORKSPACE/client-${{ matrix.id }}.log" \
+            --exit-on-server-gone 2>&1 | tee "$GITHUB_WORKSPACE/client-${{ matrix.id }}-console.log"
 
-      - name: Upload diagnostic logs
+      - name: Upload client logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cado-client-diagnostic-${{ github.run_id }}
+          name: cado-rescue-client-${{ matrix.id }}-${{ github.run_id }}
           path: |
-            diagnostic.log
-            client.log
+            client-${{ matrix.id }}.log
+            client-${{ matrix.id }}-console.log
+            endpoint-check.txt
           retention-days: 1
