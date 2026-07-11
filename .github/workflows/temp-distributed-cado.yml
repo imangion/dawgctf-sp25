@@ -1,0 +1,233 @@
+name: Temporary distributed CADO factorization
+
+on:
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential cmake git python3 python3-flask python3-requests libgmp-dev libhwloc-dev libsqlite3-dev
+
+      - name: Build CADO-NFS once
+        run: |
+          git clone --depth 1 https://github.com/cado-nfs/cado-nfs.git
+          cd cado-nfs
+          export HOSTNAME=cado-runner
+          make -j2 > build.log 2>&1 || { tail -300 build.log; exit 1; }
+          eval "$(make show)"
+          test -x "$build_tree/sieve/las"
+          echo "Build tree: $build_tree"
+
+      - name: Cache compiled CADO tree
+        uses: actions/cache/save@v4
+        with:
+          path: cado-nfs
+          key: temporary-cado-${{ github.sha }}
+
+  server:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      GH_TOKEN: ${{ github.token }}
+      N: "10116826442515149051392611733205827011722944451362642771770045505667725998729915183231335575925571009069841003168435739560778665229411847850106225023806421"
+    steps:
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3 python3-flask python3-requests libgmp10 libhwloc15 libsqlite3-0 curl
+
+      - name: Restore compiled CADO tree
+        uses: actions/cache/restore@v4
+        with:
+          path: cado-nfs
+          key: temporary-cado-${{ github.sha }}
+          fail-on-cache-miss: true
+
+      - name: Run factor server
+        id: factor
+        shell: bash
+        run: |
+          set -u
+          export HOSTNAME=cado-runner
+          chmod -R u+rwX cado-nfs
+          mkdir -p work
+
+          timeout --signal=TERM 19800s ./cado-nfs/cado-nfs.py "$N" \
+            -t 2 \
+            tasks.linalg.threads=4 \
+            tasks.workdir="$GITHUB_WORKSPACE/work" \
+            tasks.wutimeout=1800 \
+            tasks.maxtimedout=10000 \
+            server.address=0.0.0.0 \
+            server.port=8001 \
+            server.ssl=no \
+            server.whitelist=0.0.0.0/0 \
+            --server > server.log 2>&1 &
+          CADO_PID=$!
+
+          for i in $(seq 1 180); do
+            if curl -fsS --max-time 2 http://127.0.0.1:8001/ >/dev/null 2>&1; then
+              break
+            fi
+            if ! kill -0 "$CADO_PID" 2>/dev/null; then
+              echo "CADO exited before server startup"
+              tail -300 server.log
+              exit 1
+            fi
+            sleep 2
+          done
+
+          curl -L --retry 5 --fail -o cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          ./cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8001 > tunnel.log 2>&1 &
+          TUNNEL_PID=$!
+
+          ENDPOINT=""
+          for i in $(seq 1 120); do
+            ENDPOINT=$(grep -Eo 'https://[-a-z0-9]+\.trycloudflare\.com' tunnel.log | tail -1 || true)
+            [ -n "$ENDPOINT" ] && break
+            sleep 2
+          done
+          if [ -z "$ENDPOINT" ]; then
+            echo "Cloudflare endpoint was not created"
+            cat tunnel.log
+            kill "$CADO_PID" 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "CADO endpoint: $ENDPOINT"
+          gh api "repos/$GITHUB_REPOSITORY/issues/${{ github.event.pull_request.number }}/comments" \
+            -f body="CADO_ENDPOINT_${GITHUB_RUN_ID}=${ENDPOINT}"
+
+          wait "$CADO_PID" || true
+          kill "$TUNNEL_PID" 2>/dev/null || true
+
+          echo "===== LAST SERVER LOG LINES ====="
+          tail -300 server.log
+
+          python3 - <<'PY' | tee decrypt_result.txt
+          import re
+          from pathlib import Path
+
+          N = 10116826442515149051392611733205827011722944451362642771770045505667725998729915183231335575925571009069841003168435739560778665229411847850106225023806421
+          e = 65537
+          c = int('42143df2f5213a1db4a1f1c3a9ed70b86f0e8735ed18791e554559e82d4e78dfd1cca6c6efef480ac9fa30287f922a912ce16ceab1e09dfe9417e821d74cd401', 16)
+          text = Path('server.log').read_text(errors='ignore')
+          for path in Path('work').rglob('*'):
+              if path.is_file() and path.stat().st_size < 100_000_000:
+                  try:
+                      text += '\n' + path.read_text(errors='ignore')
+                  except Exception:
+                      pass
+          nums = {int(x) for x in re.findall(r'(?<![0-9])[0-9]{20,}(?![0-9])', text)}
+          factors = sorted(x for x in nums if 1 < x < N and N % x == 0)
+          if not factors:
+              print('FACTOR_NOT_FINISHED')
+              raise SystemExit(0)
+          p = factors[0]
+          q = N // p
+          print(f'P={p}')
+          print(f'Q={q}')
+          d = pow(e, -1, (p - 1) * (q - 1))
+          em = pow(c, d, N).to_bytes((N.bit_length() + 7) // 8, 'big')
+          if em.startswith(b'\x00\x02') and b'\x00' in em[2:]:
+              msg = em.split(b'\x00', 2)[2]
+          else:
+              msg = em.lstrip(b'\x00')
+          print('EM_HEX=' + em.hex())
+          print('PLAINTEXT_REPR=' + repr(msg))
+          try:
+              decoded = msg.decode()
+              print('PLAINTEXT=' + decoded)
+              match = re.search(r'[A-Za-z0-9_!-]+\{[^}\r\n]+\}', decoded)
+              if match:
+                  print('FLAG=' + match.group(0))
+          except UnicodeDecodeError:
+              pass
+          PY
+
+          if grep -q '^FLAG=' decrypt_result.txt; then
+            RESULT=$(grep '^FLAG=' decrypt_result.txt | tail -1)
+            gh api "repos/$GITHUB_REPOSITORY/issues/${{ github.event.pull_request.number }}/comments" \
+              -f body="CADO_RESULT_${GITHUB_RUN_ID}=${RESULT}"
+          fi
+
+      - name: Upload server state and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: temporary-cado-server-${{ github.run_id }}
+          path: |
+            server.log
+            tunnel.log
+            decrypt_result.txt
+            work
+          retention-days: 1
+          compression-level: 1
+
+  client:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3 python3-requests libgmp10 libhwloc15 libsqlite3-0
+
+      - name: Restore compiled CADO tree
+        uses: actions/cache/restore@v4
+        with:
+          path: cado-nfs
+          key: temporary-cado-${{ github.sha }}
+          fail-on-cache-miss: true
+
+      - name: Wait for endpoint and run client
+        shell: bash
+        run: |
+          set -u
+          ENDPOINT=""
+          for i in $(seq 1 180); do
+            ENDPOINT=$(gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/issues/${{ github.event.pull_request.number }}/comments" \
+              --jq ".[].body" 2>/dev/null | \
+              sed -n "s/^CADO_ENDPOINT_${GITHUB_RUN_ID}=//p" | tail -1 || true)
+            [ -n "$ENDPOINT" ] && break
+            sleep 5
+          done
+          if [ -z "$ENDPOINT" ]; then
+            echo "No server endpoint found"
+            exit 1
+          fi
+
+          cd cado-nfs
+          export HOSTNAME=cado-runner
+          eval "$(make show)"
+          echo "Client ${{ matrix.id }} connecting to $ENDPOINT"
+          python3 ./cado-nfs-client.py \
+            --server="$ENDPOINT" \
+            --bindir="$build_tree" \
+            --basepath="/tmp/cado-client-${{ matrix.id }}" \
+            --clientid="gha-${GITHUB_RUN_ID}-${{ matrix.id }}" \
+            --downloadretry=5 \
+            --max_connection_failures=30 \
+            --exit-on-server-gone
